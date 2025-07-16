@@ -212,3 +212,94 @@ print(f"Negative Log-Likelihood on Held-Out Interventional Data: {negll}")
 **Note:** The `neg_ave_log_likelihood` function in `dibs.metrics` might need a small wrapper to accept and pass the `interv_msk_ho` to the `eltwise_log_likelihood_interv` function, as the base metric function signature is generic.
 
 By following this workflow, you can fully leverage the capabilities of the `dibs` library to both train on and evaluate with interventional data, leading to a much more rigorous and insightful causal analysis.
+
+## 6. Deeper Dive: How the Likelihood Calculation Works
+
+To fully understand how the `interv_mask` influences training, it's essential to trace its path through the code and see exactly where it's used. Since your experiments use the nonlinear Gaussian model, the key implementation is in `dibs.models.nonlinearGaussian.py`.
+
+### The Journey of the Intervention Mask
+
+Here is the precise path the intervention mask takes from the top-level training loop down to the core likelihood calculation:
+
+1.  **Top Level (`svgd.py`):** The `_svgd_step` function in the `JointDiBS` class is the engine of the training loop. In each step, it needs to compute the gradient of the model's log probability with respect to the learnable parameters (the graph `Z` and the neural network weights `theta`). To do this, it calls a function to get the likelihood of the data.
+
+2.  **Mid Level (`dibs.py`):** The `DiBS` base class has a generic `eltwise_log_joint_prob` method. This method takes the training data (`self.x`) and the training intervention mask (`self.interv_mask`) and passes them directly to the `log_joint_prob` function that was provided when the `JointDiBS` object was initialized.
+
+    ```python
+    # In dibs.py inside DiBS.eltwise_log_joint_prob
+    # This calls the function from your nonlinearGaussian model
+    return vmap(self.log_joint_prob, (0, None, None, None, None), 0)(
+        gs, single_theta, self.x, self.interv_mask, rng
+    )
+    ```
+
+3.  **Model Level (`nonlinearGaussian.py`):** The `log_joint_prob` function provided by the `DenseNonlinearGaussian` class is `interventional_log_joint_prob`. This function receives the graph, parameters, data (`x`), and the `interv_targets` (which is the `interv_mask` we passed in). Its job is to combine the likelihood of the data and the prior probability of the parameters. It calls `self.log_likelihood` to get the data likelihood, passing the mask along.
+
+    ```python
+    # In nonlinearGaussian.py
+    def interventional_log_joint_prob(self, g, theta, x, interv_targets, rng):
+        log_prob_theta = self.log_prob_parameters(g=g, theta=theta)
+        log_likelihood = self.log_likelihood(g=g, theta=theta, x=x, interv_targets=interv_targets)
+        return log_prob_theta + log_likelihood
+    ```
+
+4.  **The Core Logic (`nonlinearGaussian.py`):** The `log_likelihood` function contains the exact implementation where the intervention mask has its effect.
+
+    ```python
+    # In nonlinearGaussian.py
+    def log_likelihood(self, *, x, theta, g, interv_targets):
+        # ... (calculates the means for all nodes based on their parents) ...
+        all_means = self.double_eltwise_nn_forward(theta, all_x_msk)
+
+        # The crucial part:
+        return jnp.sum(
+            jnp.where(
+                interv_targets,  # The condition: is the node intervened on?
+                0.0,             # If YES, its contribution to the log-likelihood is 0.
+                jax_normal.logpdf(x=x, loc=all_means, scale=jnp.sqrt(self.obs_noise)) # If NO, calculate the normal log-likelihood.
+            )
+        )
+    ```
+
+### Step-by-Step Demonstration of the `jnp.where` Logic
+
+The `jnp.where` function is the heart of the interventional likelihood. Let's trace a single data point for a 3-variable system to see how it works.
+
+-   **Ground Truth Graph:** `0 -> 1 -> 2`
+-   **A single data sample `x`:** `[0.5, 1.2, 2.3]`
+-   **The intervention mask for this sample:** `[0, 1, 0]` (We intervened on node 1, setting its value to `1.2`).
+
+Here's how `log_likelihood` processes this sample:
+
+1.  **For Node 0 (observational):**
+    -   The mask value is `0` (False).
+    -   `jnp.where` executes the third argument: it calculates the log-likelihood of `x[0]=0.5` given its parents (none).
+    -   Contribution: `logpdf(0.5 | parents_of_0)`
+
+2.  **For Node 1 (interventional):**
+    -   The mask value is `1` (True).
+    -   `jnp.where` executes the second argument: it **discards** any potential log-likelihood calculation and simply returns **`0.0`**.
+    -   Contribution: `0.0`
+
+3.  **For Node 2 (observational):**
+    -   The mask value is `0` (False).
+    -   `jnp.where` executes the third argument: it calculates the log-likelihood of `x[2]=2.3` given its parent (node 1).
+    -   Contribution: `logpdf(2.3 | parents_of_2)`
+
+The total log-likelihood for this data sample is the sum of these contributions. The model's parameters will only be updated based on how well they explain nodes 0 and 2. The contribution from the intervened node 1 has been correctly and explicitly zeroed out, preventing the model from trying to "explain" a value that was manually forced.
+
+## 7. Final Distinction: The Two Meanings of "Setting to 0"
+
+Let's clarify the most common point of confusion: the difference between setting a **data value** to 0 and setting a **likelihood contribution** to 0.
+
+*   **Setting the DATA to 0 (Your Responsibility):**
+    *   This happens during **data generation**. When you decide to intervene on a variable, you must choose a value to set it to. The `make_synthetic_bayes_net` function uses `0.0` as a convenient default for its simulated interventions (a "zero-clamp").
+    *   This is **your choice**. If you are working with real-world data or a different simulation, you can and should use any value that makes sense for your domain (e.g., `50.0`, `-10.0`, etc.). The value you choose becomes a permanent part of your data matrix `x`.
+    *   The library **never** changes the values in your data matrix `x`.
+
+*   **Setting the LIKELIHOOD CONTRIBUTION to 0 (Library's Responsibility):**
+    *   This happens during **training and evaluation**. It is a direct consequence of the mathematics of Structural Causal Models (SCMs).
+    *   When the library sees a `1` in your `interv_mask` for a specific data point, it knows that this value was forced. Therefore, the likelihood of that value occurring *given its parents* is meaningless for learning about the parents.
+    *   To handle this correctly, the library **sets the log-likelihood contribution of that specific intervened data point to 0**. This effectively removes it from the gradient calculation for its parent-child relationships, ensuring the model only learns from the parts of the system that were allowed to evolve naturally.
+
+In short: You set the **data** to your desired intervention value. The library sees your mask and sets the **likelihood contribution** to zero to perform the correct causal learning.
