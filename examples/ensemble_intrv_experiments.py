@@ -1,4 +1,3 @@
-
 """
 Ensemble Experiments for Causal Discovery with Interventional Data (Principled Approach)
 
@@ -13,6 +12,8 @@ import jax.tree_util
 import numpy as np
 import time
 import functools
+import jax.numpy as jnp
+import igraph as ig
 
 from dibs.target import make_synthetic_bayes_net, make_graph_model
 from dibs.models import DenseNonlinearGaussian
@@ -20,80 +21,110 @@ from dibs.inference import JointDiBS
 from dibs.metrics import expected_shd, threshold_metrics, neg_ave_log_likelihood
 from dibs.utils import visualize_ground_truth
 
+def create_interventional_data(key, n_vars, n_observations, n_ho_observations, n_intervention_sets, perc_intervened):
+    """
+    Generates and processes synthetic data with interventions.
+    """
+    print("\n" + "="*70)
+    print("1. GENERATING GROUND TRUTH DATA (WITH SINGLE-TARGET INTERVENTIONS)")
+    print("="*70)
+
+    key, subk = random.split(key)
+
+    # Define graph model, and separate generative/likelihood models
+    graph_model = make_graph_model(n_vars=n_vars, graph_prior_str="sf")
+
+    # This model creates the ground truth data
+    generative_model = DenseNonlinearGaussian(
+        n_vars=n_vars, hidden_layers=(5,), obs_noise=0.1, sig_param=1.0)
+
+    # This model is used by the inference algorithm
+    likelihood_model = DenseNonlinearGaussian(
+        n_vars=n_vars, hidden_layers=(5,), obs_noise=0.1, sig_param=1.0)
+
+    data = make_synthetic_bayes_net(
+        key=subk,
+        n_vars=n_vars,
+        graph_model=graph_model,
+        generative_model=generative_model,
+        n_observations=n_observations,
+        n_ho_observations=n_ho_observations,
+        n_intervention_sets=n_intervention_sets,
+        perc_intervened=perc_intervened
+    )
+
+    # Create the training dataset by combining observational and interventional training data
+
+    # 1. Start with observational training data and a corresponding all-False mask
+    all_train_data = [data.x]
+    all_train_masks = [jnp.zeros_like(data.x, dtype=bool)]
+
+    # 2. Start with observational held-out data and a corresponding all-False mask
+    all_ho_data = [data.x_ho]
+    all_ho_masks = [jnp.zeros_like(data.x_ho, dtype=bool)]
+
+    # 3. Process each intervention set: split into training and held-out portions
+    for interv_dict, interv_x in data.x_interv:
+        # Split the interventional data into training and held-out (same ratio as observational)
+        n_train_samples = data.x.shape[0]  # Same as N_OBSERVATIONS
+        n_ho_samples = data.x_ho.shape[0]  # Same as N_HO_OBSERVATIONS
+        
+        key, subk = random.split(key)
+        interv_x_full = generative_model.sample_obs(
+            key=subk,
+            n_samples=n_train_samples + n_ho_samples,
+            g=ig.Graph.Adjacency(data.g.tolist()),
+            theta=data.theta,
+            interv=interv_dict
+        )
+        
+        # Split interventional data
+        interv_x_train = interv_x_full[:n_train_samples]
+        interv_x_ho = interv_x_full[n_train_samples:n_train_samples + n_ho_samples]
+        
+        # Add training interventional data
+        all_train_data.append(interv_x_train)
+        mask_train_interv = jnp.zeros_like(interv_x_train, dtype=bool)
+        intervened_nodes = list(interv_dict.keys())
+        mask_train_interv = mask_train_interv.at[:, intervened_nodes].set(True)
+        all_train_masks.append(mask_train_interv)
+        
+        # Add held-out interventional data
+        all_ho_data.append(interv_x_ho)
+        mask_ho_interv = jnp.zeros_like(interv_x_ho, dtype=bool)
+        mask_ho_interv = mask_ho_interv.at[:, intervened_nodes].set(True)
+        all_ho_masks.append(mask_ho_interv)
+
+    # 4. Concatenate everything into single JAX arrays for JointDiBS
+    x_train = jnp.concatenate(all_train_data, axis=0)
+    mask_train = jnp.concatenate(all_train_masks, axis=0)
+
+    x_ho_combined = jnp.concatenate(all_ho_data, axis=0)
+    mask_ho_combined = jnp.concatenate(all_ho_masks, axis=0)
+
+    print(f"Ground truth graph from a single consistent model: `data.g`")
+    print(f"\nTotal training samples: {x_train.shape[0]}")
+    print(f"Total held-out samples: {x_ho_combined.shape[0]} (includes interventional)")
+    print(f"Percentage of training samples that are interventional: {100 * (1 - data.x.shape[0] / x_train.shape[0]):.2f}%")
+
+    return (x_train, mask_train, x_ho_combined, mask_ho_combined,
+            data.g, graph_model, likelihood_model)
+
+
 # # Setup
 key = random.PRNGKey(42)
 print(f"JAX backend: {jax.default_backend()}")
 
-# ## 1. Generate Ground Truth Data (with Single-Target Interventions)
-print("\n" + "="*70)
-print("1. GENERATING GROUND TRUTH DATA (WITH SINGLE-TARGET INTERVENTIONS)")
-print("="*70)
-
-N_VARS = 20
-N_OBSERVATIONS = 100
-N_HO_OBSERVATIONS = 100
-
-key, subk = random.split(key)
-
-# Define graph model, and separate generative/likelihood models
-graph_model = make_graph_model(n_vars=N_VARS, graph_prior_str="sf")
-
-# This model creates the ground truth data
-generative_model = DenseNonlinearGaussian(
-    n_vars=N_VARS, hidden_layers=(5,), obs_noise=0.1, sig_param=1.0)
-
-# This model is used by the inference algorithm
-likelihood_model = DenseNonlinearGaussian(
-    n_vars=N_VARS, hidden_layers=(5,), obs_noise=0.1, sig_param=1.0)
-
-
-# Generate observational data first
-data_obs = make_synthetic_bayes_net(
-    key=subk,
-    n_vars=N_VARS,
-    graph_model=graph_model,
-    generative_model=generative_model, # Use the generative model here
-    n_observations=N_OBSERVATIONS,
-    n_ho_observations=N_HO_OBSERVATIONS,
-    n_intervention_sets=0, # No interventions here
+# ## 1. Generate Data
+(x_train, mask_train, x_ho_combined, mask_ho_combined,
+ g_true, graph_model, likelihood_model) = create_interventional_data(
+    key=key,
+    n_vars=20,
+    n_observations=100,
+    n_ho_observations=100,
+    n_intervention_sets=10,
+    perc_intervened=0.1
 )
-print(f"Generated {data_obs.x.shape[0]} observational samples.")
-
-# Now, generate single-target interventional data for one specific target
-INTERVENTION_TARGET = 0
-key, subk = random.split(key)
-# We can reuse the same graph and generative model to ensure the intervention
-# happens on the same underlying system.
-data_interv = make_synthetic_bayes_net(
-    key=subk,
-    n_vars=N_VARS,
-    graph_model=graph_model,
-    generative_model=generative_model, # Use the generative model here
-    n_observations=N_OBSERVATIONS,
-    n_ho_observations=N_HO_OBSERVATIONS,
-    n_intervention_sets=1,
-    perc_intervened=0.05 # Corresponds to 1 variable in a 20-variable system
-)
-interv_dict, x_interv_full = data_interv.x_interv[0]
-print(f"Generated {x_interv_full.shape[0]} samples for intervention on target(s): {list(interv_dict.keys())}")
-
-# Create the training and testing datasets with masks
-x_train_obs, x_ho_obs = data_obs.x, data_obs.x_ho
-x_interv_train, x_interv_ho = np.split(x_interv_full, 2)
-
-mask_interv = np.zeros_like(x_interv_full, dtype=int)
-for target_node in interv_dict.keys():
-    mask_interv[:, target_node] = 1
-mask_interv_train, mask_interv_ho = np.split(mask_interv, 2)
-
-x_train = np.vstack([x_train_obs, x_interv_train])
-mask_train = np.vstack([np.zeros_like(x_train_obs, dtype=int), mask_interv_train])
-x_ho = np.vstack([x_ho_obs, x_interv_ho])
-mask_ho = np.vstack([np.zeros_like(x_ho_obs, dtype=int), mask_interv_ho])
-
-print(f"\nTotal training samples: {x_train.shape[0]}")
-print(f"Total held-out samples: {x_ho.shape[0]}")
-print(f"Percentage of training samples that are interventional: {100 * (x_interv_train.shape[0] / x_train.shape[0]):.2f}%")
 
 
 # ## 2. Experiment Parameters
@@ -151,19 +182,24 @@ print(f"Finished in {ensemble_time:.2f}s")
 
 # ## 5. Evaluation on Interventional Data
 
-def compute_metrics_interventional(dist, name, dibs_instance):
-    eshd = expected_shd(dist=dist, g=data_obs.g)
-    auroc = threshold_metrics(dist=dist, g=data_obs.g)['roc_auc']
+def compute_metrics_interventional(dist, name, dibs_instance, x_ho, mask_ho, g_true):
+    """Computes and prints metrics for a given particle distribution."""
+    eshd = expected_shd(dist=dist, g=g_true)
+    auroc = threshold_metrics(dist=dist, g=g_true)['roc_auc']
     
-    # Create a temporary evaluation function to correctly handle the interventional likelihood.
-    def temp_eval_neg_ll(dist, x, mask):
-        log_probs = dist.log_prob(g=dist.g, theta=dist.theta)
-        ll_fn = functools.partial(dibs_instance.eltwise_log_likelihood_interv, x_ho=x, interv_msk_ho=mask)
-        ll_per_particle = jax.vmap(ll_fn)(dist.g, dist.theta)
-        ll_samples = jnp.mean(ll_per_particle, axis=1)
+    # This evaluation function computes the negative log-likelihood on the held-out set.
+    def eval_neg_ll(dist, x, mask):
+        # vmap over particles
+        @functools.partial(vmap, in_axes=(0, 0, None, None))
+        def get_ll_samples(g, theta, x, interv_mask):
+            return dibs_instance.likelihood_model.log_prob(g=g, theta=theta, x=x, interv_mask=interv_mask)
+
+        ll_samples = get_ll_samples(dist['g'], dist['theta'], x, mask)
+        log_probs = dist['log_prob']
         return -jnp.sum(jnp.exp(log_probs) * ll_samples)
 
-    negll = temp_eval_neg_ll(dist, x_ho, mask_ho)
+    # Evaluate on the held-out data (observational + interventional)
+    negll = eval_neg_ll(dist, x_ho, mask_ho)
 
     print(f'{name:25s} | E-SHD: {eshd:5.2f}  AUROC: {auroc:5.3f}  NegLL: {negll:7.2f}')
     return {'eshd': eshd, 'auroc': auroc, 'negll': negll}
@@ -173,14 +209,14 @@ print("5. RESULTS (ON INTERVENTIONAL DATA)")
 print("="*70)
 
 # SVGD results
-svgd_emp_metrics = compute_metrics_interventional(svgd_empirical, 'SVGD Empirical', dibs_svgd)
-svgd_mix_metrics = compute_metrics_interventional(svgd_mixture, 'SVGD Mixture', dibs_svgd)
+svgd_emp_metrics = compute_metrics_interventional(svgd_empirical, 'SVGD Empirical', dibs_svgd, x_ho_combined, mask_ho_combined, g_true)
+svgd_mix_metrics = compute_metrics_interventional(svgd_mixture, 'SVGD Mixture', dibs_svgd, x_ho_combined, mask_ho_combined, g_true)
 
 print("-"*70)
 
 # True ensemble results
-true_emp_metrics = compute_metrics_interventional(true_ensemble_empirical, 'Ensemble Empirical', dibs_ensemble)
-true_mix_metrics = compute_metrics_interventional(true_ensemble_mixture, 'Ensemble Mixture', dibs_ensemble)
+true_emp_metrics = compute_metrics_interventional(true_ensemble_empirical, 'Ensemble Empirical', dibs_ensemble, x_ho_combined, mask_ho_combined, g_true)
+true_mix_metrics = compute_metrics_interventional(true_ensemble_mixture, 'Ensemble Mixture', dibs_ensemble, x_ho_combined, mask_ho_combined, g_true)
 print("="*70)
 
 
