@@ -303,3 +303,51 @@ Let's clarify the most common point of confusion: the difference between setting
     *   To handle this correctly, the library **sets the log-likelihood contribution of that specific intervened data point to 0**. This effectively removes it from the gradient calculation for its parent-child relationships, ensuring the model only learns from the parts of the system that were allowed to evolve naturally.
 
 In short: You set the **data** to your desired intervention value. The library sees your mask and sets the **likelihood contribution** to zero to perform the correct causal learning.
+
+## 8. Evaluating Held-Out Data with Negative Log-Likelihood (NLL)
+
+The Negative Log-Likelihood (NLL) is a standard metric for evaluating how well a probabilistic model explains unseen data. In the context of causal discovery with interventions, it tells us how likely the held-out data is, given the causal graphs and parameters learned by the model.
+
+### The Equation and Its Correspondence to the Code
+
+The total log-likelihood of a dataset `D` given a single causal graph `G` and its parameters `θ` is the product of the probabilities of each individual data point. When working with logarithms, this product becomes a sum:
+
+`log P(D | G, θ) = Σᵢ log P(xᵢ | G, θ)`
+
+where `xᵢ` is the *i*-th data sample (a vector of all variables).
+
+For a Structural Causal Model (SCM), the probability of a single sample `xᵢ` is the product of the probabilities of each variable `xᵢⱼ` given its causal parents `pa(j)`:
+
+`log P(xᵢ | G, θ) = Σⱼ log P(xᵢⱼ | pa(j), θ)`
+
+This corresponds directly to the `log_likelihood` function in the code. However, when interventions are present, we must modify this equation. If a variable `j` was intervened upon in sample `i`, its probability is no longer determined by its parents. The correct formulation is:
+
+`log P(xᵢ | G, θ, Mᵢ) = Σⱼ (1 - Mᵢⱼ) * log P(xᵢⱼ | pa(j), θ)`
+
+where `Mᵢ` is the intervention mask for sample `i`. The term `(1 - Mᵢⱼ)` ensures that if `Mᵢⱼ` is 1 (an intervention), the entire term becomes zero, effectively removing it from the sum. This is precisely what the `jnp.where(interv_mask, 0.0, ...)` logic in the code implements.
+
+Finally, since our model is a *distribution* of particles (graphs and parameters), not just one, we compute the *expected* log-likelihood by averaging over all particles, weighted by their posterior probabilities:
+
+`Expected log P(D_ho | D_train) = Σₖ [ P(Gₖ, θₖ | D_train) * log P(D_ho | Gₖ, θₖ) ]`
+
+This is what the `compute_metrics_interventional` function in the example script calculates. The NLL is simply the negative of this value.
+
+### How to Interpret the NLL Values
+
+-   **Lower is Better:** A lower NLL indicates a higher average log-likelihood, meaning the model assigns higher probability to the unseen held-out data. This is a sign of a better, more generalizable model.
+
+-   **Relative, Not Absolute:** The absolute value of the NLL is often hard to interpret on its own. Its primary utility is for **comparing models**. If Model A has a lower NLL on the same held-out dataset than Model B, we can conclude that Model A is a better fit for the data.
+
+-   **The Role of the Mask:** When evaluating on a held-out set containing interventions, using the correct `mask_ho` is crucial. If you were to evaluate the interventional held-out data but use an all-zero mask (i.e., treat it as purely observational), the model would be penalized for failing to predict the values of the intervened nodes. This would result in a misleadingly high NLL (poor score).
+
+### The Logic of Setting the Mask to 0 for Observational Data
+
+When you have a row in your data that is purely observational, the corresponding row in your `interv_mask` should be all zeros. Let's see why this is correct according to the equation:
+
+`log P(xᵢ | G, θ, Mᵢ) = Σⱼ (1 - Mᵢⱼ) * log P(xᵢⱼ | pa(j), θ)`
+
+If `Mᵢ` is a vector of all zeros, then `(1 - Mᵢⱼ)` is always `1`. The equation simplifies to:
+
+`log P(xᵢ | G, θ) = Σⱼ log P(xᵢⱼ | pa(j), θ)`
+
+This is the standard formula for the log-likelihood of observational data in an SCM. By setting the mask to all zeros for an observational sample, you are telling the model to use the standard likelihood calculation, which is exactly what is required. The model will evaluate how well it predicts *every single variable* from its learned parents, which is the correct way to assess its fit to observational data.
