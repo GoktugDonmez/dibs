@@ -20,7 +20,7 @@ from jax import vmap
 from dibs.target import make_synthetic_bayes_net, make_graph_model
 from dibs.models import DenseNonlinearGaussian
 from dibs.inference import JointDiBS
-from dibs.metrics import expected_shd, threshold_metrics
+from dibs.metrics import expected_shd, threshold_metrics, neg_ave_log_likelihood
 
 def create_interventional_data(key, n_vars, n_observations, n_ho_observations, n_intervention_sets, perc_intervened):
     """
@@ -82,24 +82,19 @@ def create_interventional_data(key, n_vars, n_observations, n_ho_observations, n
     print(f"Held-out interventional samples: {x_ho_intrv.shape[0]}")
 
     return (x_train, mask_train, x_ho_obs, x_ho_intrv, mask_ho_intrv,
-            data.g, graph_model, likelihood_model,data_ground_truth)
+            data.g, graph_model, likelihood_model, data)
 
 def compute_metrics(dist, name, dibs_instance, x_ho, mask_ho, g_true):
     """Computes and prints metrics for a given particle distribution."""
     eshd = expected_shd(dist=dist, g=g_true)
     auroc = threshold_metrics(dist=dist, g=g_true)['roc_auc']
     
-    # This vmapped function computes the log-likelihood for each particle
-    @functools.partial(vmap, in_axes=(0, 0, None, None))
-    def get_ll_samples(g, theta, x, interv_mask):
-        return dibs_instance.likelihood_model.log_prob(g=g, theta=theta, x=x, interv_mask=interv_mask)
-
-    # Get log-likelihood for each particle in the distribution
-    ll_samples = get_ll_samples(dist['g'], dist['theta'], x_ho, mask_ho)
-    
-    # Compute the posterior predictive log-likelihood, averaged over particles
-    log_probs = dist['log_prob']
-    negll = -jnp.sum(jnp.exp(log_probs) * ll_samples)
+    # Compute negative average log-likelihood
+    negll = neg_ave_log_likelihood(
+        dist=dist, 
+        eltwise_log_likelihood=lambda g, theta: dibs_instance.likelihood_model.log_prob(g=g, theta=theta, x=x_ho, interv_mask=mask_ho),
+        x=None  # Not used since we provide lambda with x and mask baked in
+    )
 
     print(f'{name:25s} | E-SHD: {eshd:5.2f}  AUROC: {auroc:5.3f}  NegLL: {negll:7.2f}')
     return {'eshd': eshd, 'auroc': auroc, 'negll': negll}
@@ -110,7 +105,7 @@ print(f"JAX backend: {jax.default_backend()}")
 
 # 1. Generate Data
 (x_train, mask_train, x_ho_obs, x_ho_intrv, mask_ho_intrv,
- g_true, graph_model, likelihood_model,data_ground_truth) = create_interventional_data(
+ g_true, graph_model, likelihood_model, data) = create_interventional_data(
     key=key, n_vars=20, n_observations=100, n_ho_observations=100,
     n_intervention_sets=10, perc_intervened=0.1)
 
@@ -158,21 +153,47 @@ dibs_ensemble = JointDiBS(x=x_train, interv_mask=mask_train, graph_model=graph_m
 true_ensemble_mixture = dibs_ensemble.get_mixture(combined_gs, combined_thetas)
 print(f"Finished in {ensemble_time:.2f}s")
 
-# 5. Evaluation
+# --- 5. Evaluation ---
 print("\n" + "="*70)
 print("5. EVALUATION")
 print("="*70)
 
+# Compute structural metrics once (they are the same for obs and intrv)
+svgd_eshd = expected_shd(dist=svgd_mixture, g=g_true)
+svgd_auroc = threshold_metrics(dist=svgd_mixture, g=g_true)['roc_auc']
+
+ens_eshd = expected_shd(dist=true_ensemble_mixture, g=g_true)
+ens_auroc = threshold_metrics(dist=true_ensemble_mixture, g=g_true)['roc_auc']
+
 # --- 5a. On OBSERVATIONAL Held-Out Data ---
 print("--- 5a. On OBSERVATIONAL Held-Out Data ---")
-mask_ho_obs = jnp.zeros_like(x_ho_obs, dtype=bool) # Mask is all False
-svgd_obs_metrics = compute_metrics(svgd_mixture, 'SVGD Mixture (Obs)', dibs_svgd, x_ho_obs, mask_ho_obs, g_true)
-ens_obs_metrics = compute_metrics(true_ensemble_mixture, 'Ensemble Mixture (Obs)', dibs_ensemble, x_ho_obs, mask_ho_obs, g_true)
+svgd_negll_obs = neg_ave_log_likelihood(
+    dist=svgd_mixture,
+    eltwise_log_likelihood=dibs_svgd.eltwise_log_likelihood_observ,
+    x=x_ho_obs
+)
+ens_negll_obs = neg_ave_log_likelihood(
+    dist=true_ensemble_mixture,
+    eltwise_log_likelihood=dibs_ensemble.eltwise_log_likelihood_observ,
+    x=x_ho_obs
+)
+print(f'SVGD Mixture (Obs)      | E-SHD: {svgd_eshd:5.2f}  AUROC: {svgd_auroc:5.3f}  NegLL: {svgd_negll_obs:7.2f}')
+print(f'Ensemble Mixture (Obs)  | E-SHD: {ens_eshd:5.2f}  AUROC: {ens_auroc:5.3f}  NegLL: {ens_negll_obs:7.2f}')
 
 # --- 5b. On INTERVENTIONAL Held-Out Data ---
 print("\n--- 5b. On INTERVENTIONAL Held-Out Data ---")
-svgd_intrv_metrics = compute_metrics(svgd_mixture, 'SVGD Mixture (Intrv)', dibs_svgd, x_ho_intrv, mask_ho_intrv, g_true)
-ens_intrv_metrics = compute_metrics(true_ensemble_mixture, 'Ensemble Mixture (Intrv)', dibs_ensemble, x_ho_intrv, mask_ho_intrv, g_true)
+svgd_negll_intrv = neg_ave_log_likelihood(
+    dist=svgd_mixture,
+    eltwise_log_likelihood=lambda g, theta, x: dibs_svgd.eltwise_log_likelihood_interv(g, theta, x, mask_ho_intrv),
+    x=x_ho_intrv
+)
+ens_negll_intrv = neg_ave_log_likelihood(
+    dist=true_ensemble_mixture,
+    eltwise_log_likelihood=lambda g, theta, x: dibs_ensemble.eltwise_log_likelihood_interv(g, theta, x, mask_ho_intrv),
+    x=x_ho_intrv
+)
+print(f'SVGD Mixture (Intrv)    | E-SHD: {svgd_eshd:5.2f}  AUROC: {svgd_auroc:5.3f}  NegLL: {svgd_negll_intrv:7.2f}')
+print(f'Ensemble Mixture (Intrv)| E-SHD: {ens_eshd:5.2f}  AUROC: {ens_auroc:5.3f}  NegLL: {ens_negll_intrv:7.2f}')
 
 # 6. Summary
 print("\n" + "="*70)
@@ -181,13 +202,12 @@ print("="*70)
 print(f"Computation time:")
 print(f"  SVGD ({N_PARTICLES} particles):      {svgd_time:6.1f}s")
 print(f"  Deep Ensemble ({N_ENSEMBLE_RUNS} × 1):   {ensemble_time:6.1f}s")
-
 print("\n{:<25} | {:>10} | {:>10}".format("Metric", "SVGD", "Ensemble"))
 print("-"*51)
-print("{:<25} | {:10.2f} | {:10.2f}".format("E-SHD", svgd_obs_metrics['eshd'], ens_obs_metrics['eshd']))
-print("{:<25} | {:10.3f} | {:10.3f}".format("AUROC", svgd_obs_metrics['auroc'], ens_obs_metrics['auroc']))
-print("{:<25} | {:10.2f} | {:10.2f}".format("NLL (Observational)", svgd_obs_metrics['negll'], ens_obs_metrics['negll']))
-print("{:<25} | {:10.2f} | {:10.2f}".format("NLL (Interventional)", svgd_intrv_metrics['negll'], ens_intrv_metrics['negll']))
+print("{:<25} | {:10.2f} | {:10.2f}".format("E-SHD", svgd_eshd, ens_eshd))
+print("{:<25} | {:10.3f} | {:10.3f}".format("AUROC", svgd_auroc, ens_auroc))
+print("{:<25} | {:10.2f} | {:10.2f}".format("NLL (Observational)", svgd_negll_obs, ens_negll_obs))
+print("{:<25} | {:10.2f} | {:10.2f}".format("NLL (Interventional)", svgd_negll_intrv, ens_negll_intrv))
 print("="*70)
 
 # 7. Save Results
@@ -198,7 +218,6 @@ print("="*70)
 results_path = "experiment_results.csv"
 with open(results_path, "w") as f:
     f.write("Method,ESHD,AUROC,NLL_Observational,NLL_Interventional,Time_sec\n")
-    f.write(f"SVGD,{svgd_obs_metrics['eshd']:.4f},{svgd_obs_metrics['auroc']:.4f},{svgd_obs_metrics['negll']:.2f},{svgd_intrv_metrics['negll']:.2f},{svgd_time:.2f}\n")
-    f.write(f"Ensemble,{ens_obs_metrics['eshd']:.4f},{ens_obs_metrics['auroc']:.4f},{ens_obs_metrics['negll']:.2f},{ens_intrv_metrics['negll']:.2f},{ensemble_time:.2f}\n")
-
+    f.write(f"SVGD,{svgd_eshd:.4f},{svgd_auroc:.4f},{svgd_negll_obs:.2f},{svgd_negll_intrv:.2f},{svgd_time:.2f}\n")
+    f.write(f"Ensemble,{ens_eshd:.4f},{ens_auroc:.4f},{ens_negll_obs:.2f},{ens_negll_intrv:.2f},{ensemble_time:.2f}\n")
 print(f"Results successfully saved to {results_path}")
