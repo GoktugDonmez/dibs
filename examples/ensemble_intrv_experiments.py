@@ -141,6 +141,7 @@ for i in range(N_ENSEMBLE_RUNS):
     key, subk = random.split(key)
     dibs_single = JointDiBS(x=x_train, interv_mask=mask_train, graph_model=graph_model, likelihood_model=likelihood_model)
     gs, thetas = dibs_single.sample(key=subk, n_particles=1, steps=N_STEPS)
+    
     ensemble_gs.append(gs)
     ensemble_thetas.append(thetas)
     print("✓")
